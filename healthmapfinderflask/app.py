@@ -9,82 +9,147 @@ from os import getenv
 import pathlib
 import os
 from fuzzywuzzy import process
-
-# Set up environment variables
-# from dotenv import load_dotenv
-
-# load_dotenv()
-
-# Get the current working directory
-
-# Dynamically get the base directory of the script
-base_dir = os.path.abspath(os.path.join(os.getcwd(), '..', '..', 'Capstone-Project-Final', 'Dataset'))
-
-# Construct the dataset path
-dataset_path = os.path.join(base_dir, 'Hospital inmoratlity.csv')
-
-print(dataset_path)
-
+from flask_cors import CORS
 
 app = Flask(__name__)
-from flask_cors import CORS
 CORS(app)
 
-# hospitals = [
-#     {"id": "1", "name": "General Hospital", "rating": 4.5, "specialty": "General Medicine", "distance": "2.5 miles", "address": "123 Healthcare Ave"},
-#     {"id": "2", "name": "City Medical Center", "rating": 4.8, "specialty": "Emergency Care", "distance": "3.1 miles", "address": "456 Wellness Blvd"},
-#     {"id": "3", "name": "Community Health Hospital", "rating": 4.2, "specialty": "Family Medicine", "distance": "1.8 miles", "address": "789 Care Street"},
-# ]
 
-dataset = pd.read_csv(dataset_path)
-# print(dataset)
-def get_suggestions(location, measure_name, top_n=5):
-    # Filter by location
-    location_filtered = dataset[dataset['City'].str.contains(location, case=False, na=False)]
+# Load the dataset once when the app starts
+try:
+    dataset = pd.read_csv(r"D:\Assignment\Assignment\Capstone-Project-Final\healthmapfinderflask\Hospital inmoratlity.csv")
+    # Clean column names and handle missing values
+    dataset = dataset.fillna('')  # Replace NaN with empty string
+    # Ensure all required columns exist
+    # Map the column names from the dataset to the required format
+    dataset = dataset.rename(columns={
+        'Facility ID': 'Provider ID',
+        'Facility Name': 'Hospital Name', 
+        'Address': 'Address',
+        'City/Town': 'City',
+        'State': 'State',
+        'ZIP Code': 'ZIP Code',
+        'County/Parish': 'County',
+        'Score': 'Score'
+    })
+    required_columns = ['Provider ID', 'Hospital Name', 'Address', 'City', 'State', 'ZIP Code', 'County', 'Score']
+    for col in required_columns:
+        if col not in dataset.columns:
+            raise ValueError(f"Required column '{col}' not found in dataset")
+except Exception as e:
+    print(f"Error loading dataset: {str(e)}")
+    dataset = pd.DataFrame()  # Create empty DataFrame if loading fails
+
+@app.route('/api/locations/search', methods=['GET'])
+def search_locations():
     
-    if location_filtered.empty:
-        return []
-    
-    # Get approximate matches for Measure Name
-    measure_names = location_filtered['Measure Name'].tolist()
-    matched_measures = process.extract(measure_name, measure_names, limit=top_n)
-    
-    # Prepare results in desired format
-    results = []
-    for match, score in matched_measures:
-        matching_row = location_filtered[location_filtered['Measure Name'] == match].iloc[0]
-        results.append({
-            "id": str(matching_row["Provider ID"]),
-            "name": matching_row["Hospital Name"],
-            "rating": round(matching_row["Score"], 1),  # Example rating, can modify based on data
-            "specialty": match,
-            "distance": "Unknown",  # Placeholder, replace with actual data if available
-            "address": matching_row["Address"]
-        })
-    
-    return results
+    if dataset.empty:
+        return jsonify({"error": "Dataset not available"}), 500
+
+    query = request.args.get('query', '').strip()
+    field = request.args.get('field', 'City')
+    if not query or len(query) < 2:
+        return jsonify([]), 200
+
+    try:
+        # Map of valid fields to their dataset column names
+        field_mapping = {
+            'City': 'City',
+            'State': 'State',
+            'County': 'County'
+        }
+        
+        if field not in field_mapping:
+            return jsonify({"error": f"Invalid field. Valid fields are: {', '.join(field_mapping.keys())}"}), 400
+            
+        # Get unique values from dataset that match the query
+        column = field_mapping[field]
+        # Convert to string and handle case-insensitive search
+        matching_rows = dataset[dataset[column].astype(str).str.contains(query, case=False, na=False)]
+        
+        # Get unique cities
+        unique_locations = matching_rows.groupby(['City', 'State', 'County', 'ZIP Code']).first().reset_index()
+        
+        # Prepare results
+        # Get unique display strings first
+        display_strings = unique_locations.apply(lambda x: f"{x['City']}, {x['State']}", axis=1).unique()
+        
+        # Create results from unique display strings
+        results = []
+        for i, display_string in enumerate(display_strings[:10]):  # Limit to 10 results
+            city, state = display_string.split(", ")
+            row = unique_locations[
+                (unique_locations['City'] == city) & 
+                (unique_locations['State'] == state)
+            ].iloc[0]
+            
+            results.append({
+                "id": str(i + 1),
+                "city": str(row.get("City", "")),
+                "state": str(row.get("State", "")), 
+                "county": str(row.get("County", "")),
+                "displayString": display_string
+            })
+        return jsonify(results), 200
+        
+    except Exception as e:
+        print(f"Error processing request: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/api/hospitals/search', methods=['GET'])
 def search_hospitals():
-    location = request.args.get('location', '')
-    health_issue = request.args.get('healthIssue', '')
-    
-    if not location or not health_issue:
-        return jsonify({"error": "Location and health issue are required."}), 400
-    
-    suggestions = get_suggestions(location, health_issue)
+    if dataset.empty:
+        return jsonify({"error": "Dataset not available"}), 500
 
-    
-    if not suggestions:
-        return jsonify({"message": "No suggestions found for the given input."}), 404
-    
-    return jsonify(suggestions), 200
+    location = request.args.get('location', '').strip()
+    health_issue = request.args.get('healthIssue', '').strip()
 
-@app.route('/api/patients/register', methods=['POST'])
-def register_patient():
-    data = request.json
-    data['id'] = "generated-id"  # Simulate generating a unique ID
-    return jsonify(data)
+    if not location:
+        return jsonify({"error": "Location is required"}), 400
+
+    try:
+        # Parse city and state from location string (format: "CITY, STATE")
+        city, state = [part.strip() for part in location.split(',', 1)]
+        
+        # Filter hospitals by city and state
+        matching_hospitals = dataset[
+            (dataset['City'].str.upper() == city.upper()) & 
+            (dataset['State'].str.upper() == state.upper())
+        ]
+
+        if matching_hospitals.empty:
+            return jsonify([]), 200
+
+        # Sort hospitals by Score (assuming higher is better)
+        matching_hospitals = matching_hospitals.sort_values('Score', ascending=False)
+
+        # Prepare results
+        results = []
+        for _, hospital in matching_hospitals.iterrows():
+            results.append({
+                "id": str(hospital.get("Provider ID", "")),
+                "name": str(hospital.get("Hospital Name", "")),
+                "address": str(hospital.get("Address", "")),
+                "city": str(hospital.get("City", "")),
+                "state": str(hospital.get("State", "")),
+                "zipCode": str(hospital.get("ZIP Code", "")),
+                "county": str(hospital.get("County", "")),
+                "score": float(hospital.get("Score", 0)),
+                "distance": None,  # To be implemented with geolocation
+                "specialties": [],  # To be implemented with additional data
+                "ratings": {
+                    "overall": float(hospital.get("Score", 0)) / 20,  # Convert score to 0-5 scale
+                    "quality": None,  # To be implemented with additional data
+                    "safety": None   # To be implemented with additional data
+                }
+            })
+        print(results)
+
+        return jsonify(results), 200
+
+    except Exception as e:
+        print(f"Error processing hospital search request: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
